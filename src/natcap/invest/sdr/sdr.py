@@ -15,6 +15,7 @@ import pygeoprocessing
 import pygeoprocessing.routing
 from osgeo import gdal
 from osgeo import ogr
+from osgeo import osr
 from shapely.errors import GEOSException
 
 from natcap.invest import gettext
@@ -471,6 +472,17 @@ MODEL_SPEC = spec.ModelSpec(
             data_type=float,
             units=u.none
         ),
+        spec.VectorOutput(
+            id="reprojected_watersheds",
+            path="intermediate_outputs/reprojected_watersheds.gpkg",
+            about=gettext(
+                "Reprojected copy of the input watersheds vector if the input"
+                " watersheds vector is in a different projection than the"
+                " target projection."
+            ),
+            geometry_types={"POLYGON", "MULTIPOLYGON"},
+            fields=[]
+        ),
         spec.SingleBandRasterOutput(
             id="aligned_dem",
             path="intermediate_outputs/aligned_dem.tif",
@@ -680,6 +692,28 @@ def execute(args):
     target_projection_wkt = utils.get_raster_or_vector_projection(
         target_projection_path)
 
+    watersheds_projection_wkt = utils.get_raster_or_vector_projection(
+        args['watersheds_path'])
+    watersheds_sr = osr.SpatialReference()
+    watersheds_sr.ImportFromWkt(watersheds_projection_wkt)
+
+    target_sr = osr.SpatialReference()
+    target_sr.ImportFromWkt(target_projection_wkt)
+
+    if not watersheds_sr.IsSame(target_sr):
+        reproject_watersheds = task_graph.add_task(
+            func=pygeoprocessing.reproject_vector,
+            args=(
+                args['watersheds_path'], target_projection_wkt,
+                f_reg['reprojected_watersheds']),
+            target_path_list=[f_reg['reprojected_watersheds']],
+            task_name='reproject watersheds')
+        watersheds = f_reg['reprojected_watersheds']
+        align_dependent_tasks = [reproject_watersheds]
+    else:
+        watersheds = args['watersheds_path']
+        align_dependent_tasks = []
+
     align_task = task_graph.add_task(
         func=pygeoprocessing.align_and_resize_raster_stack,
         args=(
@@ -687,13 +721,14 @@ def execute(args):
             target_pixel_size, 'intersection'),
         kwargs={
             'target_projection_wkt': target_projection_wkt,
-            'base_vector_path_list': (args['watersheds_path'],),
+            'base_vector_path_list': (watersheds,),
             'raster_align_index': base_list.index(target_pixelsize_path),
             'vector_mask_options': {
-                'mask_vector_path': args['watersheds_path'],
+                'mask_vector_path': watersheds,
             },
         },
         target_path_list=aligned_list,
+        dependent_task_list=align_dependent_tasks,
         task_name='align input rasters')
 
     mutual_mask_task = task_graph.add_task(
@@ -1030,7 +1065,7 @@ def execute(args):
     _ = task_graph.add_task(
         func=_generate_report,
         args=(
-            args['watersheds_path'], f_reg['usle'],
+            watersheds, f_reg['usle'],
             f_reg['sed_export'], f_reg['sed_deposition'],
             f_reg['avoided_export'], f_reg['avoided_erosion'],
             f_reg['watershed_results_sdr']),
