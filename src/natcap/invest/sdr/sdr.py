@@ -45,7 +45,9 @@ MODEL_SPEC = spec.ModelSpec(
     reporter="natcap.invest.sdr.reporter",
     about=_model_description,
     validate_spatial_overlap=True,
-    different_projections_ok=False,
+    different_projections_ok=True,
+    default_pixelsize_id="dem_path",
+    default_projection_id="dem_path",
     aliases=(),
     module_name=__name__,
     input_field_order=[
@@ -54,13 +56,14 @@ MODEL_SPEC = spec.ModelSpec(
         ["lulc_path", "biophysical_table_path"],
         ["watersheds_path", "drainage_path"],
         ["flow_dir_algorithm", "threshold_flow_accumulation", "k_param",
-         "sdr_max", "ic_0_param", "l_max"]
+         "sdr_max", "ic_0_param", "l_max"],
+        ["target_projection_id", "target_pixelsize_id"]
     ],
     inputs=[
         spec.WORKSPACE,
         spec.SUFFIX,
         spec.N_WORKERS,
-        spec.PROJECTED_DEM,
+        spec.DEM,
         spec.SingleBandRasterInput(
             id="erosivity_path",
             name=gettext("erosivity"),
@@ -70,7 +73,6 @@ MODEL_SPEC = spec.ModelSpec(
             ),
             data_type=float,
             units=u.megajoule * u.millimeter / (u.hectare * u.hour * u.year),
-            projected=True
         ),
         spec.SingleBandRasterInput(
             id="erodibility_path",
@@ -81,7 +83,6 @@ MODEL_SPEC = spec.ModelSpec(
             ),
             data_type=float,
             units=u.metric_ton * u.hectare * u.hour / (u.hectare * u.megajoule * u.millimeter),
-            projected=True
         ),
         spec.SingleBandRasterInput(
             id="lulc_path",
@@ -93,7 +94,6 @@ MODEL_SPEC = spec.ModelSpec(
             ),
             data_type=int,
             units=u.none,
-            projected=True
         ),
         spec.VectorInput(
             id="watersheds_path",
@@ -105,7 +105,6 @@ MODEL_SPEC = spec.ModelSpec(
             ),
             geometry_types={"POLYGON", "MULTIPOLYGON"},
             fields=[],
-            projected=True
         ),
         spec.CSVInput(
             id="biophysical_table_path",
@@ -172,7 +171,21 @@ MODEL_SPEC = spec.ModelSpec(
             units=u.none,
             projected=None
         ),
-        spec.FLOW_DIR_ALGORITHM
+        spec.FLOW_DIR_ALGORITHM,
+        spec.TARGET_PROJECTION.model_copy(update=dict(
+            about=spec.TARGET_PROJECTION.about + gettext(
+                "We do not recommend deviating from the projection of the "
+                "DEM, as this may cause unexpected results.")
+        )),
+        spec.TARGET_PIXELSIZE.model_copy(update=dict(
+            about=spec.TARGET_PIXELSIZE.about + gettext(
+                "The pixel will be a square with a side length equal to the "
+                "smaller of this raster's pixel width and height. This raster "
+                "will also be used to set the alignment during resampling. We "
+                "do not recommend deviating from the pixel size of the DEM, "
+                "as this may cause unexpected results. "
+            )
+        ))
     ],
     outputs=[
         spec.SingleBandRasterOutput(
@@ -618,6 +631,12 @@ def execute(args):
         args['l_max'] (number): the maximum allowed value of the slope length
             parameter (L) in the LS factor. If the calculated value of L
             exceeds 'l_max' it will be clamped to this value.
+        args['target_projection_id'] (string): (optional) ``id`` of a spatial
+            input listed in ``MODEL_SEPC.inputs`` that defines the target
+            projection.
+        args['target_pixelsize_id'] (string): (optional) ``id`` of a spatial
+            input listed in ``MODEL_SEPC.inputs`` that defines the target
+            pixel size.
         args['n_workers'] (int): if present, indicates how many worker
             processes should be used in parallel processing. -1 indicates
             single process mode, 0 is single process but non-blocking mode,
@@ -628,6 +647,9 @@ def execute(args):
 
     """
     args, f_reg, task_graph = MODEL_SPEC.setup(args)
+    args = MODEL_SPEC.preprocess_spatial_reference_args(args)
+    target_projection_path = args[args['target_projection_id']]
+    target_pixelsize_path = args[args['target_pixelsize_id']]
 
     biophysical_df = MODEL_SPEC.get_input(
         'biophysical_table_path').get_validated_dataframe(
@@ -651,9 +673,12 @@ def execute(args):
         masked_list.append(f_reg['masked_drainage'])
         interpolation_list.append('near')
 
-    dem_raster_info = pygeoprocessing.get_raster_info(args['dem_path'])
-    min_pixel_size = numpy.min(numpy.abs(dem_raster_info['pixel_size']))
+    target_pixelsize_info = pygeoprocessing.get_raster_info(
+        target_pixelsize_path)
+    min_pixel_size = numpy.min(numpy.abs(target_pixelsize_info['pixel_size']))
     target_pixel_size = (min_pixel_size, -min_pixel_size)
+    target_projection_wkt = utils.get_raster_or_vector_projection(
+        target_projection_path)
 
     align_task = task_graph.add_task(
         func=pygeoprocessing.align_and_resize_raster_stack,
@@ -661,9 +686,9 @@ def execute(args):
             base_list, aligned_list, interpolation_list,
             target_pixel_size, 'intersection'),
         kwargs={
-            'target_projection_wkt': dem_raster_info['projection_wkt'],
+            'target_projection_wkt': target_projection_wkt,
             'base_vector_path_list': (args['watersheds_path'],),
-            'raster_align_index': 0,
+            'raster_align_index': base_list.index(target_pixelsize_path),
             'vector_mask_options': {
                 'mask_vector_path': args['watersheds_path'],
             },
